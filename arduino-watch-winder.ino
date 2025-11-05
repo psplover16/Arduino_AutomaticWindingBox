@@ -3,9 +3,9 @@
 
 // 定義常數
 const float SECONDS_PER_ROTATION = 6.2;  // 馬達6.2秒轉1圈
-const unsigned int HALF_ROTATION_PAUSE = 500; // 半圈間休息 (毫秒)
+const unsigned int HALF_ROTATION_PAUSE = 800; // 半圈間休息 (毫秒)
 const unsigned int SHORT_REST_CYCLE = 10;     // 每 10 次循環休息
-const unsigned int SHORT_REST_TIME = 800000;  // 短暫休息 800 秒 (13分20秒)
+const unsigned int SHORT_REST_TIME = 780000;  // 短暫休息 780 秒 (13分鐘)
 
 void setup() {
   Serial.begin(9600);
@@ -132,13 +132,15 @@ bool waitWithCheck(unsigned long duration) {
   return true;
 }
 
-// 0.5秒休息期間持續檢查 A4 狀態
+// 0.5秒休息期間持續檢查 A4 狀態變化
 void delayWithCheck(unsigned long ms) {
   unsigned long startTime = millis();
+  int initialState = digitalRead(A4); // 記錄初始狀態
   while (millis() - startTime < ms) {
     digitalWrite(A0, LOW);
     digitalWrite(A1, LOW);
-    if (digitalRead(A4) == LOW) return;
+    // 如果狀態改變,立即返回
+    if (digitalRead(A4) != initialState) return;
     delay(10);
   }
 }
@@ -150,14 +152,15 @@ void stopMotor() {
 
 /*
 程式說明：
-- 目標：一天轉動約 1086 圈
-- 單次循環：18秒轉動 + 220秒休息 + 18秒轉動 + 220秒休息 = 476秒
-- 一天循環次數：86400秒 ÷ 476秒 ≈ 181次
-- 每次循環圈數：6圈 (順時針3圈 + 逆時針3圈)
-- 總圈數：181 × 6 ≈ 1086圈
+- 目標：一天轉動約 1000 圈
+- 單次循環：1圈轉動(6.2秒) + 0.8秒休息 + 0.8秒休息 = 7.8秒/圈
+- 每 10 圈休息 780 秒 (13分鐘)
+- 一天循環次數：100 次 (1000圈 ÷ 10圈)
+- 總時間：(10圈 × 7.8秒 + 780秒) × 100 = 86400秒 = 24小時
+- 總圈數：100 × 10 = 1000 圈
 
 控制邏輯：
-- 開關關閉(A4=HIGH)：正常模式，一天1086圈
+- 開關關閉(A4=HIGH)：正常模式，一天1000圈
 - 開關打開(A4=LOW)：高速模式，連續轉動無休息
 
 適用機芯：NH35A (建議800-1200圈/天)
