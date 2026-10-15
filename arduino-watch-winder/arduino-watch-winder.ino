@@ -1,4 +1,6 @@
-// 有馬達顯示。斷網與強制重置 UX優化
+// ESP32-WROVER + DRV8833 機械錶自動上鍊盒
+// v2：預設速度修正、開機/設定後 IDLE 緩衝、統一 analogWrite、Wi-Fi 路由只註冊一次。
+// 注意：軟體無法保證 ESP32 進入 setup() 前的 GPIO15 啟動電位不造成瞬間輸入。
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -6,17 +8,23 @@
 
 // ==========================================
 // 硬體腳位定義
-// ==========================================
+// ========================================== 
 #define MOTOR_IN1    15
 #define MOTOR_IN2    14
 #define WIFI_SWITCH  13   // 實體開關（最高控制權）
+
+// ==========================================
+// 系統時間與穩定參數設定
+// ==========================================
+#define WIFI_STABILIZE_DELAY 100  // Wi-Fi 啟動後的電源回血緩衝時間（毫秒），可依實際狀況調整
 
 // ==========================================
 // 系統常數設定
 // ==========================================
 #define PWM_MIN      147  
 #define PWM_MAX      232  
-#define DEBOUNCE_TIME 50   // 實體開關軟體防彈跳時間 (毫秒)
+#define DEBOUNCE_TIME 50       // 實體開關軟體防彈跳時間 (毫秒)
+#define IDLE_BUFFER_TIME 500UL // 馬達每次啟動前的靜止緩衝時間 (毫秒)
 
 WebServer server(80);
 Preferences preferences;
@@ -26,7 +34,7 @@ Preferences preferences;
 // ==========================================
 struct Config {
   int mode = 1;             
-  int speed = 200;          
+  int speed = 40;           // 轉速百分比 0~100；預設採用 NH36 預設組合的 40%
   float runTime = 10.0;     
   float restTime = 30.0;    
   int wifiDuration = 5;     
@@ -43,6 +51,8 @@ Config cfg;
 unsigned long wifiStartTime = 0;
 unsigned long wifiOffTime = 0;   
 bool wifiActive = false;
+bool wifiShutdownPending = false;
+unsigned long wifiShutdownRequestTime = 0;
 
 // 防彈跳與開關狀態
 bool currentSwitchState = HIGH; 
@@ -54,13 +64,14 @@ bool isBooting = true;
 unsigned long bootTimer = 0;
 
 // 馬達狀態機變數
-enum MotorState { STATE_IDLE, STATE_RUNNING, STATE_BRAKING, STATE_RESTING };
+enum MotorState { STATE_IDLE, STATE_RUNNING, STATE_COASTING, STATE_RESTING };
 MotorState motorState = STATE_IDLE;
 int currentDir = 1; 
 unsigned long motorTimer = 0;
 unsigned long activeDuration = 0;
 unsigned long restDuration = 0;
-unsigned long brakeTimer = 0;
+unsigned long coastTimer = 0; // 滑行緩衝計時器
+unsigned long idleStartTime = 0; // IDLE 靜止緩衝起始時間
 
 // 函式宣告
 void loadConfig();
@@ -68,6 +79,9 @@ void saveConfigToFlash();
 void setMotor(int speed, int dir);
 void runWinderLogic();
 void startAPMode();
+void registerWebServerRoutes();
+bool updateDebouncedSwitch();
+void handlePhysicalSwitchChange();
 void turnOffWiFi();
 void handleRoot();
 void handleSave();
@@ -77,86 +91,75 @@ void handleStatus(); // 新增：提供 JSON 狀態的端點
 String getHTML();
 
 void setup() {
-  Serial.begin(115200);
-  btStop(); 
-
+  // 盡可能在 setup() 一開始就設定馬達輸出為停止。
+  // 注意：這仍無法控制晶片進入 setup() 之前的硬體啟動階段。
   pinMode(MOTOR_IN1, OUTPUT);
   pinMode(MOTOR_IN2, OUTPUT);
+  setMotor(0, 0);
+
   pinMode(WIFI_SWITCH, INPUT_PULLUP);
 
-  setMotor(0, 0); 
+  Serial.begin(115200);
+  btStop();
 
   loadConfig();
-  
-  // 開機先強制關閉 Wi-Fi，確保電壓平穩
+  registerWebServerRoutes(); // 網頁路由只註冊一次，Wi-Fi 重啟時不再重複新增
+
+  // 開機先強制關閉 Wi-Fi，確保啟動期間不開啟熱點
   WiFi.mode(WIFI_OFF);
-  
-  // 紀錄開機瞬間的開關狀態，並啟動 2 秒延遲保護計時器
+
+  // 紀錄實體開關初始狀態，並啟動 2 秒開機保護計時器
   currentSwitchState = digitalRead(WIFI_SWITCH);
   lastFlickerState = currentSwitchState;
+  lastDebounceTime = millis();
   bootTimer = millis();
+  idleStartTime = bootTimer;
+  motorTimer = bootTimer;
+  motorState = STATE_IDLE;
   isBooting = true;
-  
+
   Serial.println("【系統啟動】進入 2 秒電壓平穩保護期...");
 }
 
 void loop() {
   // ==========================================
-  // 0. 開機延遲啟動保護 (錯開湧浪電流)
+  // 0. 開機保護：最少 2 秒不啟動 Wi-Fi 排程或馬達。
+  //    期間仍持續讀取實體開關並完成防彈跳，避免沿用過期狀態。
   // ==========================================
   if (isBooting) {
-    if (millis() - bootTimer > 2000) { // 等待 2 秒
+    updateDebouncedSwitch();
+
+    const unsigned long now = millis();
+    const bool switchStable = (now - lastDebounceTime) >= DEBOUNCE_TIME;
+    if ((now - bootTimer) >= 2000UL && switchStable) {
       isBooting = false;
+
+      // 開機保護解除後，額外維持 500ms 停止狀態。
+      idleStartTime = now;
+      motorTimer = now;
+      motorState = STATE_IDLE;
+
       Serial.println("【系統自動】開機保護解除，檢查總開關狀態...");
-      
-      if (currentSwitchState == LOW) { // 開關在 ON
+      if (currentSwitchState == LOW) {
         Serial.println(" -> 總開關為 ON，安全啟動 Wi-Fi！");
         startAPMode();
-      } else { // 開關在 OFF
+      } else {
+        // 開機時開關為 OFF：清除排程起點，避免意外自動喚醒。
+        wifiOffTime = 0;
         Serial.println(" -> 總開關為 OFF，維持 Wi-Fi 關閉與排程鎖定。");
       }
     }
-    // 在這 2 秒內，讓大腦專心等待，不做其他複雜判斷
-    return; 
+
+    // 保護期的最後一輪也不執行馬達狀態機。
+    return;
   }
 
   // ==========================================
-  // 1. 實體開關絕對控制權 (包含 50ms 軟體防彈跳)
+  // 1. 實體開關優先控制權（50ms 防彈跳）
   // ==========================================
-  bool reading = digitalRead(WIFI_SWITCH);
-
-  if (reading != lastFlickerState) {
-    lastDebounceTime = millis(); 
+  if (updateDebouncedSwitch()) {
+    handlePhysicalSwitchChange();
   }
-
-  if ((millis() - lastDebounceTime) > DEBOUNCE_TIME) {
-    if (reading != currentSwitchState) {
-      currentSwitchState = reading; 
-
-      if (currentSwitchState == LOW) { 
-        // 【最高指令：ON】強制打開 Wi-Fi 或重置倒數
-        Serial.println("【實體開關】切換至 ON！ (允許 Wi-Fi)");
-        if (!wifiActive) {
-          Serial.println("  -> 執行強制啟動 Wi-Fi...");
-          startAPMode();
-        } else {
-          Serial.println("  -> Wi-Fi 已在運作，重置倒數計時器。");
-          wifiStartTime = millis(); 
-        }
-      } 
-      else if (currentSwitchState == HIGH) { 
-        // 【最高指令：OFF】立刻拔掉 Wi-Fi 並鎖死排程
-        Serial.println("【實體開關】切換至 OFF！ (鎖死排程)");
-        wifiOffTime = 0; 
-        
-        if (wifiActive) {
-          Serial.println(" -> 執行強制關閉 Wi-Fi");
-          turnOffWiFi(); 
-        }
-      }
-    }
-  }
-  lastFlickerState = reading; 
 
   // ==========================================
   // 2. Wi-Fi 電源管理與自動排程喚醒邏輯
@@ -164,10 +167,19 @@ void loop() {
   if (wifiActive) {
     server.handleClient();
 
-    unsigned long elapsedWifiTime = (millis() - wifiStartTime) / 1000;
-    if (elapsedWifiTime >= (unsigned long)(cfg.wifiDuration * 60)) {
-      Serial.println("【系統自動】Wi-Fi 保持開啟的倒數時間已到！執行關閉以省電。");
+    // 網頁「關閉 Wi-Fi」回應送出後，使用非阻塞計時等待 500ms。
+    // 不用 delay()，避免馬達在等待期間持續輸出而超過設定運轉時間。
+    if (wifiActive && wifiShutdownPending &&
+        (millis() - wifiShutdownRequestTime) >= 500UL) {
       turnOffWiFi();
+    }
+
+    if (wifiActive) {
+      unsigned long elapsedWifiTime = (millis() - wifiStartTime) / 1000UL;
+      if (elapsedWifiTime >= (unsigned long)(cfg.wifiDuration * 60)) {
+        Serial.println("【系統自動】Wi-Fi 保持開啟的倒數時間已到！執行關閉以省電。");
+        turnOffWiFi();
+      }
     }
   } else {
     // 只有在開關是 ON，且不是被 OFF 鎖死的狀態下，才允許自動喚醒
@@ -198,29 +210,109 @@ void loop() {
 // ==========================================
 // Wi-Fi 與伺服器控制區塊
 // ==========================================
-void startAPMode() {
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP("Watch_Winder_AP");
-  wifiActive = true;
-  wifiStartTime = millis();
-
+void registerWebServerRoutes() {
+  // 路由只在 setup() 註冊一次；server.stop() 不會移除這些路由。
   server.on("/", HTTP_GET, handleRoot);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/reset", HTTP_POST, handleReset);
   server.on("/off", HTTP_GET, handleTurnOffWifi);
-  server.on("/status", HTTP_GET, handleStatus); // 新增：註冊隱藏狀態 API
+  server.on("/status", HTTP_GET, handleStatus);
+}
+
+bool updateDebouncedSwitch() {
+  const unsigned long now = millis();
+  const bool reading = digitalRead(WIFI_SWITCH);
+
+  if (reading != lastFlickerState) {
+    lastFlickerState = reading;
+    lastDebounceTime = now;
+  }
+
+  if ((now - lastDebounceTime) >= DEBOUNCE_TIME &&
+      reading != currentSwitchState) {
+    currentSwitchState = reading;
+    return true;
+  }
+  return false;
+}
+
+void handlePhysicalSwitchChange() {
+  if (currentSwitchState == LOW) {
+    // ON：允許 Wi-Fi；若已開啟則重置維持時間。
+    Serial.println("【實體開關】切換至 ON！(允許 Wi-Fi)");
+    wifiOffTime = 0;
+    if (!wifiActive) {
+      Serial.println("  -> 執行強制啟動 Wi-Fi...");
+      startAPMode();
+    } else {
+      wifiStartTime = millis();
+      Serial.println("  -> Wi-Fi 已在運作，重置倒數計時器。");
+    }
+  } else {
+    // OFF：絕對鎖住自動喚醒。必須在 turnOffWiFi() 後清零，
+    // 因為 turnOffWiFi() 本身會記錄自動排程的關閉起點。
+    Serial.println("【實體開關】切換至 OFF！(鎖死排程)");
+    if (wifiActive) {
+      Serial.println(" -> 執行強制關閉 Wi-Fi");
+      turnOffWiFi();
+    }
+    wifiOffTime = 0;
+  }
+}
+
+void startAPMode() {
+  if (wifiActive) {
+    // 防止未來新增呼叫路徑時，重複啟動 AP 或重設伺服器。
+    wifiStartTime = millis();
+    return;
+  }
+
+  // 只有在馬達處於靜止狀態時，才強制壓制腳位，避免乾擾轉動中的馬達
+  if (motorState == STATE_IDLE || motorState == STATE_RESTING || motorState == STATE_COASTING) {
+    digitalWrite(MOTOR_IN1, LOW);
+    digitalWrite(MOTOR_IN2, LOW);
+  }
+
+  // 以較低功率啟動 Wi-Fi，躲避射頻天線冷啟動的湧浪電流
+  WiFi.setTxPower(WIFI_POWER_8_5dBm); 
+
+  const bool modeStarted = WiFi.mode(WIFI_AP);
+  if (!modeStarted || !WiFi.softAP("Watch_Winder_AP")) {
+    WiFi.mode(WIFI_OFF);
+    wifiActive = false;
+    wifiOffTime = millis();
+    Serial.println("【錯誤】Wi-Fi 熱點啟動失敗，已保持關閉狀態。");
+    return;
+  }
+
+  // 【改用參數】：讓電源稍微平穩，時間長度可由上方 #define 自行調控
+  delay(WIFI_STABILIZE_DELAY);
+
+  // 天線穩定後，將發射功率拉回最高 (19.5 dBm)，確保最強穿牆收訊
+  WiFi.setTxPower(WIFI_POWER_19_5dBm); 
+
+  // 路由已在 setup() 註冊，這裡只啟動 HTTP 伺服器。
   server.begin();
-  
-  Serial.println("  => [狀態] Wi-Fi 熱點已上線: Watch_Winder_AP");
+  wifiActive = true;
+  wifiStartTime = millis();
+  wifiOffTime = 0;
+
+  Serial.println("  => [狀態] Wi-Fi 熱點已上線: Watch_Winder_AP (已恢復最高功率)");
 }
 
 void turnOffWiFi() {
+  if (!wifiActive) {
+    wifiShutdownPending = false;
+    return;
+  }
+
   server.stop();
   WiFi.mode(WIFI_OFF);
   wifiActive = false;
-  // 記錄關閉時間，作為下次自動喚醒排程的起點
+  wifiShutdownPending = false;
+  // 記錄關閉時間，供自動喚醒排程使用；實體 OFF 會再清除此值。
   wifiOffTime = millis();
-  Serial.println("  => [狀態] Wi-Fi 模組已斷電關閉。");
+  Serial.println("  => [狀態] Wi-Fi 模組已關閉。");
 }
 
 // ==========================================
@@ -229,7 +321,12 @@ void turnOffWiFi() {
 void loadConfig() {
   preferences.begin("winder", true); 
   cfg.mode = preferences.getInt("mode", 1);
-  cfg.speed = preferences.getInt("speed", 200); 
+  cfg.speed = preferences.getInt("speed", 40);
+  // 舊版預設值可能是 200；若 Flash 值超出新介面的 0~100 範圍，安全回到 40%。
+  if (cfg.speed < 0 || cfg.speed > 100) {
+    cfg.speed = 40;
+    Serial.println("【系統提醒】偵測到無效轉速設定，已在本次執行改用 40%。");
+  }
   cfg.runTime = preferences.getFloat("runTF", 10.0);
   cfg.restTime = preferences.getFloat("restTF", 30.0);
   cfg.wifiDuration = preferences.getInt("wifiDur", 5); 
@@ -237,7 +334,7 @@ void loadConfig() {
   cfg.autoWakeValue = preferences.getFloat("wakeVal", 1.0);
   cfg.autoWakeUnit = preferences.getString("wakeUnit", "min");
   preferences.end();
-  Serial.println("【系統記錄】已從 Flash 讀取設定。");
+  Serial.println("【系統記錄】已從 Flash 讀取上次儲存的設定。");
 }
 
 void saveConfigToFlash() {
@@ -257,16 +354,40 @@ void saveConfigToFlash() {
 // ==========================================
 // 馬達驅動與保護邏輯區塊
 // ==========================================
+// ==========================================
+// 馬達驅動與保護邏輯區塊
+// ==========================================
 void setMotor(int pwmVal, int dir) {
+  // 1. 【新增狀態鎖】：記憶上次的指令
+  static int lastPwm = -1;
+  static int lastDir = -1;
+
+  // 如果數值沒變，直接結束，絕不讓 loop() 瘋狂重置底層 PWM 計時器
+  if (pwmVal == lastPwm && dir == lastDir) {
+    return; 
+  }
+
+  // 更新記憶體狀態
+  lastPwm = pwmVal;
+  lastDir = dir;
+
+  pwmVal = constrain(pwmVal, 0, 255);
+
+  // 2. 【強制壓制 0V】：切換狀態時，用 pinMode 與 digitalWrite 強行破解 GPIO 15 的上拉干擾
   if (pwmVal == 0 || dir == 0) {
+    // 雙腳位都強制解除 PWM 綁定，死死釘在 0V
+    pinMode(MOTOR_IN1, OUTPUT);
     digitalWrite(MOTOR_IN1, LOW);
+    pinMode(MOTOR_IN2, OUTPUT);
     digitalWrite(MOTOR_IN2, LOW);
-    analogWrite(MOTOR_IN1, 0);
-    analogWrite(MOTOR_IN2, 0);
   } else if (dir > 0) {
+    // 順時針：IN2 強制壓在 0V (防止電壓逆流)，IN1 正常發送 PWM
+    pinMode(MOTOR_IN2, OUTPUT);
     digitalWrite(MOTOR_IN2, LOW);
     analogWrite(MOTOR_IN1, pwmVal);
   } else {
+    // 逆時針：IN1 (GPIO 15) 強制壓在 0V (破解 3.3V 漂移)，IN2 正常發送 PWM
+    pinMode(MOTOR_IN1, OUTPUT);
     digitalWrite(MOTOR_IN1, LOW);
     analogWrite(MOTOR_IN2, pwmVal);
   }
@@ -274,42 +395,50 @@ void setMotor(int pwmVal, int dir) {
 
 void runWinderLogic() {
   unsigned long currentMillis = millis();
-  int mappedPWM = map(cfg.speed, 0, 100, PWM_MIN, PWM_MAX);
+  int safeSpeed = constrain(cfg.speed, 0, 100);
+  int mappedPWM = map(safeSpeed, 0, 100, PWM_MIN, PWM_MAX);
 
   switch (motorState) {
     case STATE_IDLE:
       setMotor(0, 0);
-      motorTimer = currentMillis;
-      motorState = STATE_RUNNING;
-      
+
+      // IDLE 狀態至少維持 500ms，不會在進入 IDLE 的同一輪立刻啟動馬達。
+      if (currentMillis - idleStartTime < IDLE_BUFFER_TIME) {
+        break;
+      }
+
       if (cfg.mode == 3) {
-        activeDuration = (unsigned long)((cfg.runTime * 1000.0) / 2.0); 
+        activeDuration = (unsigned long)((cfg.runTime * 1000.0) / 2.0);
         currentDir = 1;
       } else {
         activeDuration = (unsigned long)(cfg.runTime * 1000.0);
         currentDir = (cfg.mode == 1) ? 1 : -1;
       }
+      motorTimer = currentMillis;
+      motorState = STATE_RUNNING;
       break;
 
     case STATE_RUNNING:
       setMotor(mappedPWM, currentDir);
       if (currentMillis - motorTimer >= activeDuration) {
+        // DRV8833 的 00 狀態是 Coast；先滑行 1.5 秒，再換向或休息。
         setMotor(0, 0);
-        brakeTimer = currentMillis;
-        motorState = STATE_BRAKING;
+        coastTimer = currentMillis;
+        motorState = STATE_COASTING;
       }
       break;
 
-    case STATE_BRAKING:
-      if (currentMillis - brakeTimer >= 1500) {
+    case STATE_COASTING:
+      // 等待機構自然減速；此狀態不是 DRV8833 的主動電氣煞車。
+      if (currentMillis - coastTimer >= 1500UL) {
         if (cfg.mode == 3 && currentDir == 1) {
-          currentDir = -1; 
+          currentDir = -1;
           motorTimer = currentMillis;
           motorState = STATE_RUNNING;
         } else {
           motorTimer = currentMillis;
           restDuration = (unsigned long)(cfg.restTime * 1000.0);
-          motorState = STATE_RESTING; 
+          motorState = STATE_RESTING;
         }
       }
       break;
@@ -317,7 +446,10 @@ void runWinderLogic() {
     case STATE_RESTING:
       setMotor(0, 0);
       if (currentMillis - motorTimer >= restDuration) {
-        motorState = STATE_IDLE; 
+        motorState = STATE_IDLE;
+        // 已經完整經過設定的休止時間，因此不再額外增加 500ms，避免改變 TPD 計算。
+        idleStartTime = currentMillis - IDLE_BUFFER_TIME;
+        motorTimer = currentMillis;
       }
       break;
   }
@@ -339,9 +471,9 @@ void handleStatus() {
   if (motorState == STATE_RUNNING) {
     st = "RUNNING";
     remain = (activeDuration > elapsed) ? (activeDuration - elapsed) / 1000 : 0;
-  } else if (motorState == STATE_BRAKING) {
-    st = "BRAKING";
-    // 煞車不倒數
+  } else if (motorState == STATE_COASTING) {
+    st = "COASTING";
+    // 滑行緩衝期間不倒數
   } else if (motorState == STATE_RESTING) {
     st = "RESTING";
     remain = (restDuration > elapsed) ? (restDuration - elapsed) / 1000 : 0;
@@ -370,8 +502,11 @@ void handleSave() {
 
   saveConfigToFlash();
 
-  // 強制將馬達拉回 IDLE 狀態，讓新秒數立刻生效
+  // 將馬達拉回 IDLE，套用新設定前先維持 500ms 停止緩衝。
+  setMotor(0, 0);
   motorState = STATE_IDLE;
+  idleStartTime = millis();
+  motorTimer = idleStartTime;
 
   if (oldWifiDuration != cfg.wifiDuration) {
     wifiStartTime = millis();
@@ -389,8 +524,11 @@ void handleReset() {
   wifiStartTime = millis(); 
   Serial.println("  -> 設定已重置，並重新給予完整的 Wi-Fi 連線時間。");
   
-  // 同樣強制將馬達拉回 IDLE 狀態，套用重置後的秒數
-  motorState = STATE_IDLE; 
+  // 同樣拉回 IDLE，並重設 500ms 靜止緩衝計時。
+  setMotor(0, 0);
+  motorState = STATE_IDLE;
+  idleStartTime = millis();
+  motorTimer = idleStartTime; 
 
   server.send(200, "text/plain", "OK");
 }
@@ -402,19 +540,21 @@ void handleTurnOffWifi() {
   exitHtml += "<body><h2>Wi-Fi 已成功關閉</h2><p>系統已進入零干擾省電模式。<br><br>您可以直接關閉此瀏覽器分頁。</p></body></html>";
   
   server.send(200, "text/html", exitHtml);
-  delay(500); 
-  turnOffWiFi();
+  // 等待 HTTP 回應送出後再關閉熱點；採非阻塞方式，不凍結馬達狀態機。
+  wifiShutdownPending = true;
+  wifiShutdownRequestTime = millis();
 }
 
 // ==========================================
 // HTML 前端介面生成
 // ==========================================
 String getHTML() {
-  unsigned long elapsedSec = (millis() - wifiStartTime) / 1000;
-  int totalSecAllowed = cfg.wifiDuration * 60;
-  int remainSec = (totalSecAllowed > elapsedSec) ? (totalSecAllowed - elapsedSec) : 0;
-  int remMin = remainSec / 60;
-  int remS = remainSec % 60;
+  // 此處以相同的有號型別計算，避免秒數比較的 signed/unsigned 警告。
+  long elapsedSec = (long)((millis() - wifiStartTime) / 1000UL);
+  long totalSecAllowed = (long)cfg.wifiDuration * 60L;
+  long remainSec = (totalSecAllowed > elapsedSec) ? (totalSecAllowed - elapsedSec) : 0L;
+  int remMin = (int)(remainSec / 60L);
+  int remS = (int)(remainSec % 60L);
 
   String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>";
   html += "<title>自動上鍊盒控制系統</title>";
@@ -456,7 +596,7 @@ String getHTML() {
   html += "<div class='section'><label>馬達運轉模式：</label>";
   html += "<label><input type='radio' name='mode' value='1' " + String(cfg.mode == 1 ? "checked" : "") + "> 僅順時針</label>";
   html += "<label><input type='radio' name='mode' value='2' " + String(cfg.mode == 2 ? "checked" : "") + "> 僅逆時針</label>";
-  html += "<label><input type='radio' name='mode' value='3' " + String(cfg.mode == 3 ? "checked" : "") + "> 雙向交替 (自動換向煞車)</label></div>";
+  html += "<label><input type='radio' name='mode' value='3' " + String(cfg.mode == 3 ? "checked" : "") + "> 雙向交替 (滑行緩衝後換向)</label></div>";
 
   int displaySpeed = cfg.speed > 100 ? 100 : cfg.speed; 
   html += "<div class='section'><label>馬達轉速調整 (<span id='speedVal'>" + String(displaySpeed) + "</span>%)：</label>";
@@ -498,14 +638,14 @@ String getHTML() {
   html += "    document.getElementById('speedVal').innerText = 40;";
   html += "    document.querySelector('input[name=\"runTime\"]').value = '27.54';";
   html += "    document.querySelector('input[name=\"restTime\"]').value = '618.96';"; 
-  html += "    alert('【Seiko NH36 (800 TPD 護機版)】\\n建議轉速 40%\\n單次運轉 27.54 秒 (自動拆分為左3圈、右3圈)\\n休止時間 618.96 秒');";
+  html += "    alert('【Seiko NH36 (約 800 TPD 預設)】\\n建議轉速 40%\\n單次運轉 27.54 秒 (每方向約 3 圈)\\n休止時間 618.96 秒；實際 TPD 受實測轉速影響');";
   html += "  } else if(type === 'eta2824') {";
   html += "    document.querySelector('input[name=\"mode\"][value=\"3\"]').checked = true;";
   html += "    document.querySelector('input[name=\"speed\"]').value = 70;";
   html += "    document.getElementById('speedVal').innerText = 70;";
   html += "    document.querySelector('input[name=\"runTime\"]').value = '24.54';";
   html += "    document.querySelector('input[name=\"restTime\"]').value = '621.96';"; 
-  html += "    alert('【ETA 2824 (800 TPD 護機版)】\\n建議轉速 70%\\n單次運轉 24.54 秒 (自動拆分為左3圈、右3圈)\\n休止時間 621.96 秒');";
+  html += "    alert('【ETA 2824 (約 800 TPD 預設)】\\n建議轉速 70%\\n單次運轉 24.54 秒 (每方向約 3 圈)\\n休止時間 621.96 秒；實際 TPD 受實測轉速影響');";
   html += "  }";
   html += "}";
 
@@ -545,12 +685,12 @@ String getHTML() {
   html += "  fetch('/status').then(r => r.json()).then(data => {";
   html += "    let box = document.getElementById('motorStatus');";
   html += "    let modeText = (data.m == 1) ? '[順向]' : (data.m == 2) ? '[逆向]' : '[雙向]';";
-  html += "    let dirText = (data.d == 1) ? '右旋' : '左旋';"; // L298N 1=順, -1=逆
+  html += "    let dirText = (data.d == 1) ? '右旋' : '左旋';"; // d=1/-1 為程式定義的方向，實際左右旋以機構校正為準
   html += "    if(data.s === 'RUNNING') {";
   html += "      box.innerHTML = '🟢 ' + modeText + ' ' + dirText + ' ⏳ ' + data.r + '秒';";
   html += "      box.style.color = '#155724';"; // 暗綠色
-  html += "    } else if(data.s === 'BRAKING') {";
-  html += "      box.innerHTML = '⚠️ [煞車] 緩衝中...';";
+  html += "    } else if(data.s === 'COASTING') {";
+  html += "      box.innerHTML = '↘️ [滑行減速] 緩衝中...';";
   html += "      box.style.color = '#856404';"; // 暗黃色
   html += "    } else if(data.s === 'RESTING') {";
   html += "      box.innerHTML = '🌙 [休止] ⏳ ' + formatTime(data.r);";
